@@ -1,0 +1,36 @@
+[Unit]
+Description=Overleaf MCP server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=overleaf-mcp
+Group=overleaf-mcp
+WorkingDirectory=/opt/overleaf-mcp
+EnvironmentFile=/etc/overleaf-mcp/overleaf-mcp.env
+ExecStart=/usr/bin/node /opt/overleaf-mcp/src/server.mjs
+Restart=always
+RestartSec=3
+UMask=0077
+
+# git writes into STATE_DIR and needs HOME; keep both inside the sandbox.
+Environment=HOME=/var/lib/overleaf-mcp
+Environment=GIT_TERMINAL_PROMPT=0
+StateDirectory=overleaf-mcp
+RuntimeDirectory=overleaf-mcp
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+ReadWritePaths=/var/lib/overleaf-mcp
+
+[Install]
+WantedBy=multi-user.target

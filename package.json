@@ -1,0 +1,23 @@
+{
+  "name": "overleaf-mcp",
+  "version": "0.1.0",
+  "description": "Remote MCP server for Overleaf: read, parse and edit LaTeX projects over the Overleaf Git bridge, with OAuth 2.1 for hosted clients such as ChatGPT.",
+  "type": "module",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "bin": {
+    "overleaf-mcp": "./src/server.mjs"
+  },
+  "scripts": {
+    "start": "node src/server.mjs",
+    "dev": "node --watch src/server.mjs",
+    "test": "node --test test/"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.32.2",
+    "express": "^4.21.2",
+    "zod": "^3.24.1"
+  },
+  "license": "MIT"
+}
