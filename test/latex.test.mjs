@@ -79,3 +79,12 @@ test('findSection is case-insensitive on the second pass', () => {
 test('unterminated title does not throw', () => {
   assert.doesNotThrow(() => parseSections('\\section{broken'));
 });
+
+test('findIncludes returns targets in order, with .tex appended, ignoring comments', async () => {
+  const { findIncludes } = await import('../src/latex.mjs');
+  const src = String.raw`\input{preamble}
+\include{sec/1_intro}
+% \input{commented/out}
+\input{sec/0_abs.tex}`;
+  assert.deepEqual(findIncludes(src), ['preamble.tex', 'sec/1_intro.tex', 'sec/0_abs.tex']);
+});

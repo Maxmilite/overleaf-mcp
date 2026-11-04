@@ -183,6 +183,70 @@ export class OverleafRepo {
     return files.map((f) => path.relative(this.repoPath, f).split(path.sep).join('/')).sort();
   }
 
+  /**
+   * Directory listing with sizes, for navigation.
+   *
+   * A flat file list is not enough to orient in a paper repository: `sec/3_method.tex`
+   * (20 KB of prose) and `sec/figures/teaser/teaser-1.tex` (a 300-byte figure stub)
+   * are indistinguishable once the paths are flattened, and the model then guesses.
+   *
+   * Directories whose files are all filtered out still appear, annotated with how
+   * many were hidden — a paper repository is mostly figures, and listing 40 jpgs
+   * buries the five files that actually matter.
+   */
+  async listTree({ dir = '.', depth = 3, maxEntries = 400, match = () => true } = {}) {
+    const { full: startFull } = this.resolveSafePath(dir);
+    const root = path.resolve(this.repoPath);
+    const fs = await import('node:fs/promises');
+    const entries = [];
+    let truncated = false;
+
+    const walk = async (current, level) => {
+      const dirents = await fs.readdir(current, { withFileTypes: true });
+      dirents.sort((a, b) => {
+        if (a.isDirectory() !== b.isDirectory()) return a.isDirectory() ? -1 : 1;
+        return a.name.localeCompare(b.name);
+      });
+
+      let hidden = 0;
+      const childDirs = [];
+      for (const dirent of dirents) {
+        if (dirent.name === '.git' || dirent.name === 'node_modules') continue;
+        const abs = path.join(current, dirent.name);
+        const rel = path.relative(root, abs).split(path.sep).join('/');
+
+        if (dirent.isDirectory()) {
+          childDirs.push({ abs, rel });
+          continue;
+        }
+        if (!match(rel)) {
+          hidden++;
+          continue;
+        }
+        if (entries.length >= maxEntries) {
+          truncated = true;
+          continue;
+        }
+        const stat = await fs.stat(abs).catch(() => null);
+        entries.push({ rel, type: 'file', size: stat ? stat.size : 0, depth: level });
+      }
+
+      if (hidden) entries.push({ rel: path.relative(root, current).split(path.sep).join('/') || '.', type: 'hidden', count: hidden, depth: level });
+
+      for (const child of childDirs) {
+        if (entries.length >= maxEntries) {
+          truncated = true;
+          return;
+        }
+        entries.push({ rel: child.rel, type: 'dir', depth: level });
+        if (level < depth) await walk(child.abs, level + 1);
+      }
+    };
+
+    await walk(startFull, 0);
+    return { entries, truncated };
+  }
+
   async readFile(filePath) {
     const { full, rel } = this.resolveSafePath(filePath);
     let content;
@@ -193,6 +257,25 @@ export class OverleafRepo {
       throw err;
     }
     return { rel, content };
+  }
+
+  /** Raw bytes, for images and PDFs that cannot go through utf8. */
+  async readBinary(filePath) {
+    const { full, rel } = this.resolveSafePath(filePath);
+    const fs = await import('node:fs/promises');
+    try {
+      return { rel, buffer: await fs.readFile(full) };
+    } catch (err) {
+      if (err.code === 'ENOENT') throw new Error(`File not found in project: ${rel}`);
+      throw err;
+    }
+  }
+
+  async writeBinary(filePath, buffer, commitMessage) {
+    const { full, rel } = this.resolveSafePath(filePath);
+    await mkdir(path.dirname(full), { recursive: true });
+    await writeFile(full, buffer);
+    return this.commitAndPush(rel, commitMessage);
   }
 
   async writeFile(filePath, content, commitMessage) {

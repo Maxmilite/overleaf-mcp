@@ -110,3 +110,22 @@ export function findSection(sections, title) {
   const lower = wanted.toLowerCase();
   return sections.findIndex((s) => s.title.toLowerCase() === lower);
 }
+
+/**
+ * `\input{...}` / `\include{...}` targets, in document order.
+ *
+ * CVPR-style templates keep one file per section, so the root document holds
+ * almost no prose and parsing only the root yields an empty outline.
+ */
+export function findIncludes(src) {
+  const mask = maskComments(src);
+  const re = /\\(?:input|include)\s*\{([^}]+)\}/g;
+  const out = [];
+  let m;
+  while ((m = re.exec(mask)) !== null) {
+    const raw = m[1].trim();
+    if (!raw) continue;
+    out.push(/\.tex$/i.test(raw) ? raw : `${raw}.tex`);
+  }
+  return out;
+}

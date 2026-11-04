@@ -69,13 +69,37 @@ The project id is the last path segment of `https://www.overleaf.com/project/<id
 | `list_projects` | Which projects are configured |
 | `list_files` | File inventory, filtered by extension |
 | `read_file` | Verbatim file contents |
+| `get_tree` | Directory tree with sizes, so you can see how the paper is organised |
 | `get_sections` | Section outline with level, line and character range |
+| `find_section` | Search section titles across every `.tex` file |
+| `read_image` | Return a figure as a picture, so the model can look at it |
+| `upload_file` | Add a binary asset from base64 |
 | `get_section_content` | One section, including everything it owns |
 | `status_summary` | File inventory plus the outline of the root document |
 | `write_file` | Replace a whole file and push one commit |
 | `write_section` | Replace one section and push one commit |
 
 `write_section` is the one to reach for: a whole-file write silently discards anything the model failed to reproduce, while a section write is bounded by the parser.
+
+## File transfer
+
+Two ways to move assets, because they suit different sizes.
+
+**Through a tool** — `read_image` returns a figure as an MCP image block so the model can actually see it; `upload_file` takes base64 and is capped at 3 MB, since tool arguments are not a bulk transport.
+
+**Over HTTP** — for real transfers set `FILE_TOKEN` and use `/files`:
+
+```bash
+# download
+curl -H "Authorization: Bearer $FILE_TOKEN" \
+     https://host/files/default/figures/pipeline/latent.jpg -o latent.jpg
+
+# upload (path is created, change is committed and pushed)
+curl -H "Authorization: Bearer $FILE_TOKEN" -H "X-Commit-Message: Update pipeline figure" \
+     -T figures/latent.jpg https://host/files/default/figures/pipeline/latent.jpg
+```
+
+`/files` uses its own bearer token rather than the OAuth flow: the OAuth token lives inside the client, and nobody wants to dig it out to push one figure. Set `READ_ONLY=1` to refuse uploads while keeping downloads.
 
 ## Running
 

@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import path from 'node:path';
 import express from 'express';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
@@ -6,7 +7,9 @@ import { authorizationHandler } from '@modelcontextprotocol/sdk/server/auth/hand
 import { tokenHandler } from '@modelcontextprotocol/sdk/server/auth/handlers/token.js';
 import { clientRegistrationHandler } from '@modelcontextprotocol/sdk/server/auth/handlers/register.js';
 import { metadataHandler } from '@modelcontextprotocol/sdk/server/auth/handlers/metadata.js';
+import { createHash, timingSafeEqual } from 'node:crypto';
 import { loadProjects } from './config.mjs';
+import { createRepoRegistry } from './repos.mjs';
 import { registerTools } from './tools.mjs';
 import { FeishuOAuthProvider } from './oauth.mjs';
 
@@ -45,6 +48,7 @@ if (oauthConfigured && !PUBLIC_URL.startsWith('https://') && env.ALLOW_INSECURE_
 }
 
 const projects = await loadProjects(env);
+const repoFor = createRepoRegistry({ projects, stateDir: STATE_DIR });
 log(`loaded ${Object.keys(projects).length} project(s): ${Object.keys(projects).join(', ')}`);
 log(`base path "${BASE_PATH || '/'}" → resource ${RESOURCE_URL}`);
 
@@ -56,7 +60,7 @@ function buildServer() {
         'Reads and edits Overleaf projects over the Overleaf Git bridge. Call get_sections before editing so you know the exact section titles.',
     },
   );
-  registerTools(server, { projects, stateDir: STATE_DIR });
+  registerTools(server, { projects, repoFor });
   return server;
 }
 
@@ -148,6 +152,66 @@ const requireBearer = async (req, res, next) => {
     unauthorized(res);
   }
 };
+
+// ---------------------------------------------------------------------------
+// Raw file transfer, for assets too large to pass through a tool argument.
+//
+//   curl -H "Authorization: Bearer $FILE_TOKEN" https://host/files/default/figures/a.png -o a.png
+//   curl -H "Authorization: Bearer $FILE_TOKEN" -T figures/a.png https://host/files/default/figures/a.png
+//
+// Guarded by a standalone token rather than the OAuth flow: the OAuth token lives
+// in the client, and nobody wants to extract it into a shell to push a figure.
+// ---------------------------------------------------------------------------
+const FILE_TOKEN = env.FILE_TOKEN ?? '';
+const READ_ONLY = env.READ_ONLY === '1';
+const MIME_BY_EXT = {
+  '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.gif': 'image/gif',
+  '.webp': 'image/webp', '.svg': 'image/svg+xml', '.pdf': 'application/pdf', '.tex': 'text/plain; charset=utf-8',
+  '.bib': 'text/plain; charset=utf-8', '.sty': 'text/plain; charset=utf-8', '.cls': 'text/plain; charset=utf-8',
+};
+
+const requireFileToken = (req, res, next) => {
+  if (!FILE_TOKEN) return res.status(404).json({ error: 'file endpoint disabled; set FILE_TOKEN to enable it' });
+  const match = /^Bearer\s+(.+)$/i.exec(req.headers.authorization ?? '');
+  const given = Buffer.from(match?.[1]?.trim() ?? '');
+  const want = Buffer.from(FILE_TOKEN);
+  if (given.length !== want.length || !timingSafeEqual(given, want)) {
+    return res.status(401).json({ error: 'unauthorized' });
+  }
+  next();
+};
+
+const fileProject = (req) => req.params.project;
+const filePath = (req) => decodeURIComponent(req.params[0] ?? '');
+
+app.get('/files/:project/*', requireFileToken, async (req, res) => {
+  try {
+    const repo = repoFor(fileProject(req));
+    const { rel, buffer } = await repo.run(async () => {
+      await repo.fetchAndReset();
+      return repo.readBinary(filePath(req));
+    });
+    res.type(MIME_BY_EXT[path.extname(rel).toLowerCase()] ?? 'application/octet-stream').send(buffer);
+  } catch (err) {
+    res.status(404).json({ error: err.message });
+  }
+});
+
+app.put('/files/:project/*', requireFileToken, express.raw({ type: '*/*', limit: '64mb' }), async (req, res) => {
+  if (READ_ONLY) return res.status(403).json({ error: 'server is read-only' });
+  if (!Buffer.isBuffer(req.body) || !req.body.length) return res.status(400).json({ error: 'empty body' });
+  try {
+    const repo = repoFor(fileProject(req));
+    const message = String(req.headers['x-commit-message'] ?? '').trim() || `Upload ${filePath(req)}`;
+    const result = await repo.run(async () => {
+      await repo.fetchAndReset();
+      return repo.writeBinary(filePath(req), req.body, message);
+    });
+    res.json({ ok: true, path: filePath(req), bytes: req.body.length, ...result });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
 
 app.get(`${BASE_PATH}/healthz`, (_req, res) =>
   res.json({ ok: true, projects: Object.keys(projects).length, auth: oauthConfigured ? 'feishu-oauth' : 'none', basePath: BASE_PATH || '/' }),
