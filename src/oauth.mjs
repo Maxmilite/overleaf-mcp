@@ -1,4 +1,5 @@
 import { createHash, randomBytes } from 'node:crypto';
+import { InvalidGrantError } from '@modelcontextprotocol/sdk/server/auth/errors.js';
 import { readFile, writeFile, mkdir, chmod } from 'node:fs/promises';
 import path from 'node:path';
 
@@ -79,6 +80,11 @@ export class FeishuOAuthProvider {
     this.allowedOpenIds = new Set(allowedOpenIds.filter(Boolean));
     this.accessTtlSec = accessTtlSec ?? DEFAULT_ACCESS_TTL_S;
     this.log = log;
+    // The SDK also validates PKCE before calling the provider — and then passes
+    // `undefined` as the code verifier, which makes any provider-side check fail
+    // with a 500. Exactly one validator should own this; it is ours, because we
+    // already stored the challenge ourselves at /authorize.
+    this.skipLocalPkceValidation = true;
     this.store = new Store(path.join(stateDir, 'oauth.json'));
     this.ready = this.store.load();
     this.clientsStore = {
@@ -173,14 +179,16 @@ export class FeishuOAuthProvider {
     await this.ready;
     this.store.prune();
     const entry = this.store.data.codes[code];
-    if (!entry) throw new Error('authorization code is unknown or already used');
-    if (entry.expiresAt < now()) throw new Error('authorization code has expired');
-    if (entry.clientId !== client.client_id) throw new Error('authorization code was issued to a different client');
-    if (redirectUri && entry.redirectUri !== redirectUri) throw new Error('redirect_uri does not match the authorization request');
+    // InvalidGrantError keeps these as 400 invalid_grant; a plain Error becomes
+    // an opaque 500 and the client shows "couldn't connect your account".
+    if (!entry) throw new InvalidGrantError('authorization code is unknown or already used');
+    if (entry.expiresAt < now()) throw new InvalidGrantError('authorization code has expired');
+    if (entry.clientId !== client.client_id) throw new InvalidGrantError('authorization code was issued to a different client');
+    if (redirectUri && entry.redirectUri !== redirectUri) throw new InvalidGrantError('redirect_uri does not match the authorization request');
 
     if (entry.codeChallenge) {
-      if (!codeVerifier) throw new Error('code_verifier is required');
-      if (s256(codeVerifier) !== entry.codeChallenge) throw new Error('PKCE verification failed');
+      if (!codeVerifier) throw new InvalidGrantError('code_verifier is required');
+      if (s256(codeVerifier) !== entry.codeChallenge) throw new InvalidGrantError('PKCE verification failed');
     }
 
     delete this.store.data.codes[code]; // single use
@@ -191,8 +199,8 @@ export class FeishuOAuthProvider {
     await this.ready;
     this.store.prune();
     const entry = this.store.data.refresh[refreshToken];
-    if (!entry) throw new Error('refresh token is unknown or expired');
-    if (entry.clientId !== client.client_id) throw new Error('refresh token was issued to a different client');
+    if (!entry) throw new InvalidGrantError('refresh token is unknown or expired');
+    if (entry.clientId !== client.client_id) throw new InvalidGrantError('refresh token was issued to a different client');
     delete this.store.data.refresh[refreshToken];
     return this.issueTokens(client.client_id, scopes?.length ? scopes : entry.scopes, entry.subject);
   }
