@@ -67,19 +67,31 @@ The project id is the last path segment of `https://www.overleaf.com/project/<id
 | Tool | Purpose |
 |---|---|
 | `list_projects` | Which projects are configured |
-| `list_files` | File inventory, filtered by extension |
-| `read_file` | Verbatim file contents |
-| `get_tree` | Directory tree with sizes, so you can see how the paper is organised |
-| `get_sections` | Section outline with level, line and character range |
-| `find_section` | Search section titles across every `.tex` file |
-| `read_image` | Return a figure as a picture, so the model can look at it |
+| `get_tree` | File tree with sizes; binaries collapsed unless asked for |
+| `read_file` | Line-numbered read with `offset`/`limit` paging |
+| `grep` | Regex search returning `file:line` |
+| `apply_edits` | Atomic edit — exact-text or line-range, all-or-nothing |
+| `write_file` | Whole-file replace or create |
+| `read_image` | Return a figure as a picture |
 | `upload_file` | Add a binary asset from base64 |
-| `get_section_content` | One section, including everything it owns |
-| `status_summary` | File inventory plus the outline of the root document |
-| `write_file` | Replace a whole file and push one commit |
-| `write_section` | Replace one section and push one commit |
+| `status_summary` | Inventory plus the outline of the whole document tree |
 
-`write_section` is the one to reach for: a whole-file write silently discards anything the model failed to reproduce, while a section write is bounded by the parser.
+### Why there is no `write_section`
+
+An earlier version had `get_sections` / `get_section_content` / `write_section`.
+They were removed, because the abstraction is unsound:
+
+- Section titles are not unique — `Experiments` appears in both the paper and the rebuttal.
+- A section's extent is ambiguous as soon as it has subsections, and rewriting one silently deleted them.
+- `write_section` required `newContent` to repeat the heading, one more convention to get wrong.
+
+`apply_edits` replaces all three with the mechanical primitives every coding agent
+converged on: read with line numbers, then replace exact bytes. It refuses an
+ambiguous match rather than picking one, and if any edit in a call fails, nothing
+is written — a half-applied commit is worse than a retry.
+
+The LaTeX parser still exists, but only to build the outline in `status_summary`;
+no write path depends on it.
 
 ## File transfer
 

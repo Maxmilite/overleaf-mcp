@@ -214,7 +214,7 @@ app.put('/files/:project/*', requireFileToken, express.raw({ type: '*/*', limit:
 });
 
 app.get(`${BASE_PATH}/healthz`, (_req, res) =>
-  res.json({ ok: true, projects: Object.keys(projects).length, auth: oauthConfigured ? 'feishu-oauth' : 'none', basePath: BASE_PATH || '/' }),
+  res.json({ ok: true, projects: new Set(Object.values(projects).map((p) => p.projectId)).size, auth: oauthConfigured ? 'feishu-oauth' : 'none', basePath: BASE_PATH || '/' }),
 );
 
 app.use(`${BASE_PATH}/mcp`, express.json({ limit: '8mb' }), provider ? requireBearer : (_req, _res, next) => next());
