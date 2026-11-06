@@ -93,6 +93,15 @@ is written — a half-applied commit is worse than a retry.
 The LaTeX parser still exists, but only to build the outline in `status_summary`;
 no write path depends on it.
 
+### Concurrent edits
+
+Overleaf is edited in the browser while the server holds a clone, so a push can
+lose the race. When it does, the local commit is replayed on top of the other
+one and the push is retried once — the edit is not lost, and the model does not
+have to redo it against a tree that already contains it. If the two histories
+genuinely disagree, the rebase is aborted so the clone is never left
+half-resolved, and the error names the command to run on the host.
+
 ## File transfer
 
 Two ways to move assets, because they suit different sizes.

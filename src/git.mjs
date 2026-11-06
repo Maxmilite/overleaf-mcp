@@ -122,26 +122,54 @@ export class OverleafRepo {
     }
   }
 
+  async fetchQuiet() {
+    await git([...this.credentialArgs(), '-C', this.repoPath, 'fetch', '--quiet', 'origin', '+refs/heads/*:refs/remotes/origin/*']);
+  }
+
+  /**
+   * Replay local commits on top of the remote.
+   *
+   * Overleaf gets edited in the browser while we hold a clone, so a push can
+   * lose the race. Rebasing keeps our commit instead of dropping it; if the
+   * two histories disagree, abandon the rebase and leave the clone clean for a
+   * human rather than leaving a half-resolved tree behind.
+   */
+  async rebaseOntoRemote() {
+    const branch = await this.currentBranch();
+    try {
+      await git(['-C', this.repoPath, 'rebase', '--quiet', `origin/${branch}`]);
+      return true;
+    } catch {
+      await git(['-C', this.repoPath, 'rebase', '--abort']).catch(() => {});
+      return false;
+    }
+  }
+
   /**
    * Bring the working tree to exactly match the remote.
    *
    * A plain `git pull` turns an unrelated history into a merge conflict that
    * needs a human; this server has no human. Because every write pushes
    * immediately, the local tree is expected to equal the remote, so a hard
-   * reset is both safe and deterministic. If a previous push failed we refuse
-   * rather than destroy the unpushed commit.
+   * reset is both safe and deterministic.
+   *
+   * The exception is a commit left behind by a push that lost the race — that
+   * one is somebody's edit, so replay it instead of discarding it.
    */
   async fetchAndReset() {
     await this.ensureCloned();
-    await git([...this.credentialArgs(), '-C', this.repoPath, 'fetch', '--quiet', 'origin', '+refs/heads/*:refs/remotes/origin/*']);
+    await this.fetchQuiet();
     const branch = await this.currentBranch();
     const ahead = await this.commitsAhead();
+
     if (ahead > 0) {
+      if (await this.rebaseOntoRemote()) return;
       throw new Error(
-        `The local clone has ${ahead} unpushed commit(s) from an earlier failed push. ` +
-          `Resolve it on the host (git -C ${this.repoPath} log) before retrying — continuing would discard them.`,
+        `The clone has ${ahead} unpushed commit(s) that conflict with changes made on Overleaf. ` +
+          `Resolve them on the host: git -C ${this.repoPath} rebase origin/${branch}`,
       );
     }
+
     await git(['-C', this.repoPath, 'reset', '--quiet', '--hard', `origin/${branch}`]);
   }
 
@@ -297,17 +325,25 @@ export class OverleafRepo {
     await git(['-C', this.repoPath, 'commit', '--quiet', '-m', message]);
 
     const branch = await this.currentBranch();
+    const push = () => git([...this.credentialArgs(), '-C', this.repoPath, 'push', '--quiet', 'origin', `HEAD:${branch}`]);
+
     try {
-      await git([...this.credentialArgs(), '-C', this.repoPath, 'push', '--quiet', 'origin', `HEAD:${branch}`]);
+      await push();
     } catch (err) {
-      if (/rejected|non-fast-forward|fetch first/i.test(err.message)) {
+      if (!/rejected|non-fast-forward|fetch first/i.test(err.message)) throw err;
+
+      // Somebody saved in the browser between our fetch and our push. Replay our
+      // commit on top of theirs and try once more — retrying the whole tool call
+      // would redo the edit against a tree that already contains it.
+      await this.fetchQuiet();
+      if (!(await this.rebaseOntoRemote())) {
         throw new Error(
-          'The push was rejected because the project changed on Overleaf while you were editing. ' +
-            'Your change is committed locally. Call the tool again with the same arguments: the next call ' +
-            're-pulls the project, reapplies the edit, and pushes.',
+          'The project changed on Overleaf while you were editing, and the two changes conflict. ' +
+            'Your edit is committed locally but not pushed. Resolve it on the host: ' +
+            `git -C ${this.repoPath} rebase origin/${branch}`,
         );
       }
-      throw err;
+      await push();
     }
 
     const { stdout: sha } = await git(['-C', this.repoPath, 'rev-parse', '--short', 'HEAD']);
