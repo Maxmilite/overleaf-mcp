@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { parseSections, findIncludes } from './latex.mjs';
+import { convertImage, targetPathFor, SUPPORTED_INPUT, MAX_IMAGE_BYTES } from './image.mjs';
 import path from 'node:path';
 
 /**
@@ -34,6 +35,7 @@ const IMAGE_MIME = {
 };
 
 const MAX_UPLOAD_BYTES = 3 * 1024 * 1024;
+const MAX_CONVERT_BATCH_BYTES = 256 * 1024 * 1024;
 const READ_DEFAULT_LINES = 400;
 
 function formatSize(bytes) {
@@ -366,6 +368,160 @@ export function registerTools(server, { projects, repoFor }) {
         await repo.fetchAndReset();
         const result = await repo.writeFile(filePath, content, commitMessage);
         return text(describeCommit(filePath, result));
+      });
+    },
+  );
+
+  server.registerTool(
+    'move_files',
+    {
+      title: 'Move or rename files',
+      description:
+        'Move or rename files and directories, pushing one commit. Use it to reorganise figures without rewriting their contents. Paths inside \\input and \\includegraphics are not rewritten — grep for the old name afterwards.',
+      inputSchema: {
+        moves: z
+          .array(z.object({ from: z.string(), to: z.string() }))
+          .describe('Source and destination pairs, e.g. [{"from":"figures/old.png","to":"figures/new.png"}]'),
+        commitMessage: z.string().describe('Commit message shown in the Overleaf history'),
+        projectName: projectArg,
+      },
+    },
+    async ({ moves, commitMessage, projectName }) => {
+      const repo = repoFor(projectName);
+      if (!moves?.length) return errorText('moves must contain at least one pair.');
+
+      return repo.run(async () => {
+        await repo.fetchAndReset();
+        const missing = [];
+        for (const { from } of moves) {
+          const info = await repo.inspect(from).catch((err) => ({ exists: false, rel: err.message }));
+          if (!info.exists) missing.push(from);
+        }
+        if (missing.length) return errorText(`Not found, nothing was moved:\n${missing.map((m) => `  ${m}`).join('\n')}`);
+
+        const touched = [];
+        for (const { from, to } of moves) touched.push(...(await repo.moveRaw(from, to)));
+        const result = await repo.commitAndPush(touched, commitMessage);
+        const summary = moves.map((m) => `  ${m.from} → ${m.to}`).join('\n');
+        return text(`${summary}\n${describeCommit(`${moves.length} move(s)`, result)}`);
+      });
+    },
+  );
+
+  server.registerTool(
+    'delete_files',
+    {
+      title: 'Delete files',
+      description:
+        'Delete files, or directories with recursive, in one commit. Overleaf keeps the history so this is recoverable, but grep for references first — a deleted figure that is still in \\includegraphics breaks the build.',
+      inputSchema: {
+        filePaths: z.array(z.string()).describe('Paths to delete, relative to the project root'),
+        recursive: z.boolean().optional().describe('Required to delete a directory and everything inside it'),
+        commitMessage: z.string().describe('Commit message shown in the Overleaf history'),
+        projectName: projectArg,
+      },
+    },
+    async ({ filePaths, recursive, commitMessage, projectName }) => {
+      const repo = repoFor(projectName);
+      if (!filePaths?.length) return errorText('filePaths must contain at least one path.');
+
+      return repo.run(async () => {
+        await repo.fetchAndReset();
+
+        // Check the whole batch before unlinking anything, so a typo cannot leave
+        // a half-deleted directory that the next call silently rolls back.
+        const missing = [];
+        const directories = [];
+        let bytes = 0;
+        for (const p of filePaths) {
+          const info = await repo.inspect(p);
+          if (!info.exists) missing.push(p);
+          else {
+            if (info.isDirectory) directories.push(p);
+            bytes += info.size;
+          }
+        }
+        if (missing.length) return errorText(`Not found, nothing was deleted:\n${missing.map((m) => `  ${m}`).join('\n')}`);
+        if (directories.length && !recursive) {
+          return errorText(
+            `These are directories:\n${directories.map((d) => `  ${d}`).join('\n')}\n` +
+              'Pass recursive: true to delete them and everything inside.',
+          );
+        }
+
+        const removed = [];
+        for (const p of filePaths) removed.push(await repo.removeRaw(p, { recursive: true }));
+        const result = await repo.commitAndPush(removed, commitMessage);
+        const summary = removed.slice(0, 40).map((r) => `  - ${r}`).join('\n');
+        return text(
+          `${summary}${removed.length > 40 ? `\n  … ${removed.length - 40} more` : ''}\n` +
+            describeCommit(`${removed.length} path(s), ${formatSize(bytes)} freed`, result),
+        );
+      });
+    },
+  );
+
+  server.registerTool(
+    'convert_images',
+    {
+      title: 'Convert images',
+      description:
+        'Transcode images in a batch and push one commit — the only way to change image bytes, because the model cannot decode a PNG. Converting png to jpeg also rewrites the extension; update \\includegraphics with grep and apply_edits afterwards. JPEG suits photographs; line art and plots usually get smaller and sharper as PNG or PDF.',
+      inputSchema: {
+        filePaths: z.array(z.string()).describe('Image paths to convert, e.g. ["figures/a.png","figures/b.png"]'),
+        format: z.enum(['jpeg', 'png', 'webp']).describe('Target format'),
+        quality: z.number().optional().describe('1-100 for jpeg/webp. Defaults to 82.'),
+        keepOriginal: z.boolean().optional().describe('Defaults to true. Set false to delete the source after converting, which is what actually saves space.'),
+        background: z.string().optional().describe('Colour flattened behind transparency when writing jpeg, e.g. "#ffffff". Defaults to white.'),
+        commitMessage: z.string().describe('Commit message shown in the Overleaf history'),
+        projectName: projectArg,
+      },
+    },
+    async ({ filePaths, format, quality, keepOriginal, background, commitMessage, projectName }) => {
+      const repo = repoFor(projectName);
+      if (!filePaths?.length) return errorText('filePaths must contain at least one path.');
+
+      return repo.run(async () => {
+        await repo.fetchAndReset();
+
+        // Convert everything in memory first: a batch that fails on file 30 must
+        // not leave 29 half-converted files and a broken build.
+        const jobs = [];
+        let totalIn = 0;
+        for (const p of filePaths) {
+          if (!SUPPORTED_INPUT.test(p)) return errorText(`Not an image this tool can read: ${p}`);
+          const { rel, buffer } = await repo.readBinary(p);
+          if (buffer.length > MAX_IMAGE_BYTES) return errorText(`${rel} is ${formatSize(buffer.length)}, over the ${formatSize(MAX_IMAGE_BYTES)} limit.`);
+          totalIn += buffer.length;
+          if (totalIn > MAX_CONVERT_BATCH_BYTES) {
+            return errorText(`This batch is over ${formatSize(MAX_CONVERT_BATCH_BYTES)}; split it into smaller calls.`);
+          }
+          let converted;
+          try {
+            converted = await convertImage(buffer, { format, quality, background });
+          } catch (err) {
+            return errorText(`${rel}: ${err.message}\n\nNothing was written.`);
+          }
+          jobs.push({ source: rel, target: targetPathFor(rel, format), before: buffer.length, ...converted });
+        }
+
+        const written = [];
+        const removed = [];
+        for (const job of jobs) {
+          written.push(await repo.writeRaw(job.target, job.buffer));
+          if (!keepOriginal && job.target !== job.source) removed.push(await repo.removeRaw(job.source));
+        }
+
+        const result = await repo.commitAndPush([...written, ...removed], commitMessage);
+        const rows = jobs.map((j) => {
+          const delta = j.buffer.length - j.before;
+          const pct = j.before ? Math.round((delta / j.before) * 100) : 0;
+          const arrow = j.target === j.source ? 'recompressed' : `${j.source} → ${j.target}`;
+          return `  ${arrow}\n    ${formatSize(j.before)} → ${formatSize(j.buffer.length)} (${pct > 0 ? '+' : ''}${pct}%)`;
+        });
+        const grew = jobs.filter((j) => j.buffer.length >= j.before).length;
+        const note = grew ? `\n${grew} file(s) got larger — that format is a poor fit for them.` : '';
+        return text(`${rows.join('\n')}${note}\n${describeCommit(`${jobs.length} image(s) to ${format}`, result)}`);
       });
     },
   );

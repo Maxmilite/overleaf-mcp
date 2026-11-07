@@ -153,3 +153,65 @@ test('a conflicting push aborts cleanly and keeps the local commit', async () =>
     await rm(s.root, { recursive: true, force: true });
   }
 });
+
+test('delete removes files from the remote in one commit', async () => {
+  const s = await scaffold();
+  try {
+    await s.repo.fetchAndReset();
+    await s.repo.writeRaw('figures/a.png', Buffer.from('a'));
+    await s.repo.writeRaw('figures/b.png', Buffer.from('b'));
+    await s.repo.writeRaw('keep.tex', 'keep me\n');
+    await s.repo.commitAndPush(['figures/a.png', 'figures/b.png', 'keep.tex'], 'add figures');
+
+    await s.repo.removeRaw('figures/a.png');
+    const result = await s.repo.commitAndPush('figures/a.png', 'delete a');
+    assert.equal(result.committed, true);
+
+    const tree = git(s.root, '--git-dir', s.remote, 'ls-tree', '-r', '--name-only', 'main');
+    assert.doesNotMatch(tree, /figures\/a\.png/);
+    assert.match(tree, /figures\/b\.png/);
+    assert.match(tree, /keep\.tex/);
+    assert.equal(git(s.repoDir, 'status', '--porcelain'), '', 'working tree is clean');
+  } finally {
+    await rm(s.root, { recursive: true, force: true });
+  }
+});
+
+test('deleting a directory needs recursive, and refuses before touching anything', async () => {
+  const s = await scaffold();
+  try {
+    await s.repo.fetchAndReset();
+    await s.repo.writeRaw('figures/deep/a.png', Buffer.from('a'));
+    await s.repo.commitAndPush(['figures/deep/a.png'], 'add');
+
+    await assert.rejects(() => s.repo.removeRaw('figures/deep'), /directory/i);
+    // The refusal must not have eaten the contents.
+    assert.equal(await readFile(path.join(s.repoDir, 'figures', 'deep', 'a.png'), 'utf8'), 'a');
+
+    await s.repo.removeRaw('figures/deep', { recursive: true });
+    await s.repo.commitAndPush('figures/deep', 'drop the directory');
+    assert.doesNotMatch(git(s.root, '--git-dir', s.remote, 'ls-tree', '-r', '--name-only', 'main'), /figures\/deep/);
+  } finally {
+    await rm(s.root, { recursive: true, force: true });
+  }
+});
+
+test('move renames on the remote and leaves no copy behind', async () => {
+  const s = await scaffold();
+  try {
+    await s.repo.fetchAndReset();
+    await s.repo.writeRaw('figures/old.png', Buffer.from('bytes'));
+    await s.repo.commitAndPush('figures/old.png', 'add');
+
+    const touched = await s.repo.moveRaw('figures/old.png', 'figures/sub/new.png');
+    assert.deepEqual(touched, ['figures/old.png', 'figures/sub/new.png']);
+    await s.repo.commitAndPush(touched, 'rename');
+
+    const tree = git(s.root, '--git-dir', s.remote, 'ls-tree', '-r', '--name-only', 'main');
+    assert.match(tree, /figures\/sub\/new\.png/);
+    assert.doesNotMatch(tree, /figures\/old\.png/);
+    assert.equal(s.remoteFile('figures/sub/new.png'), 'bytes');
+  } finally {
+    await rm(s.root, { recursive: true, force: true });
+  }
+});

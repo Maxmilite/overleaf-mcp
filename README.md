@@ -72,9 +72,25 @@ The project id is the last path segment of `https://www.overleaf.com/project/<id
 | `grep` | Regex search returning `file:line` |
 | `apply_edits` | Atomic edit — exact-text or line-range, all-or-nothing |
 | `write_file` | Whole-file replace or create |
+| `move_files` | Rename or move, batched into one commit |
+| `delete_files` | Delete files or directories, batched into one commit |
+| `convert_images` | Transcode images in a batch; can drop the originals |
 | `read_image` | Return a figure as a picture |
 | `upload_file` | Add a binary asset from base64 |
 | `status_summary` | Inventory plus the outline of the whole document tree |
+
+### Why the server converts images
+
+Changing a figure's format is the one task a model cannot do through this server
+by itself: it cannot decode a PNG, and pushing a paper's figures through base64
+to do it client-side is neither reliable nor affordable. `convert_images` does
+the transcode with sharp and commits the whole batch at once, so "convert every
+figure to jpeg" is one call rather than one per file.
+
+Transparency is flattened onto a background rather than onto black, which is
+what sharp does if left alone and what turns a figure's white background into a
+dark rectangle. Reference updates are still the caller's job — deliberately, so
+nothing rewrites `\includegraphics` behind your back.
 
 ### Why there is no `write_section`
 

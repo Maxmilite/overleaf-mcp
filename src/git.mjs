@@ -1,6 +1,6 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { mkdir, writeFile, readFile, chmod, access } from 'node:fs/promises';
+import { mkdir, writeFile, readFile, chmod, access, rename, rm, stat } from 'node:fs/promises';
 import path from 'node:path';
 
 const execFileP = promisify(execFile);
@@ -290,20 +290,68 @@ export class OverleafRepo {
   /** Raw bytes, for images and PDFs that cannot go through utf8. */
   async readBinary(filePath) {
     const { full, rel } = this.resolveSafePath(filePath);
-    const fs = await import('node:fs/promises');
     try {
-      return { rel, buffer: await fs.readFile(full) };
+      return { rel, buffer: await readFile(full) };
     } catch (err) {
       if (err.code === 'ENOENT') throw new Error(`File not found in project: ${rel}`);
       throw err;
     }
   }
 
-  async writeBinary(filePath, buffer, commitMessage) {
+  /** Does a path exist, and is it a directory? Used to fail a batch before touching anything. */
+  async inspect(filePath) {
+    const { full, rel } = this.resolveSafePath(filePath);
+    try {
+      const info = await stat(full);
+      return { rel, exists: true, isDirectory: info.isDirectory(), size: info.size };
+    } catch {
+      return { rel, exists: false, isDirectory: false, size: 0 };
+    }
+  }
+
+  /** Write bytes without committing, so a batch can be committed as one change. */
+  async writeRaw(filePath, buffer) {
     const { full, rel } = this.resolveSafePath(filePath);
     await mkdir(path.dirname(full), { recursive: true });
     await writeFile(full, buffer);
+    return rel;
+  }
+
+  async writeBinary(filePath, buffer, commitMessage) {
+    const rel = await this.writeRaw(filePath, buffer);
     return this.commitAndPush(rel, commitMessage);
+  }
+
+  /** Remove a path without committing. Returns the repository-relative path. */
+  async removeRaw(filePath, { recursive = false } = {}) {
+    const { full, rel } = this.resolveSafePath(filePath);
+    let info;
+    try {
+      info = await stat(full);
+    } catch (err) {
+      if (err.code === 'ENOENT') throw new Error(`Cannot delete, not found in project: ${rel}`);
+      throw err;
+    }
+    if (info.isDirectory() && !recursive) {
+      throw new Error(`${rel} is a directory. Pass recursive to delete it and everything inside.`);
+    }
+    await rm(full, { recursive: info.isDirectory(), force: false });
+    return rel;
+  }
+
+  /** Move or rename a path without committing. Returns both affected paths. */
+  async moveRaw(fromPath, toPath) {
+    const src = this.resolveSafePath(fromPath);
+    const dst = this.resolveSafePath(toPath);
+    try {
+      await stat(src.full);
+    } catch (err) {
+      if (err.code === 'ENOENT') throw new Error(`Cannot move, not found in project: ${src.rel}`);
+      throw err;
+    }
+    await mkdir(path.dirname(dst.full), { recursive: true });
+    await rename(src.full, dst.full);
+    return [src.rel, dst.rel];
   }
 
   async writeFile(filePath, content, commitMessage) {
@@ -313,13 +361,15 @@ export class OverleafRepo {
     return this.commitAndPush(rel, commitMessage);
   }
 
-  async commitAndPush(rel, commitMessage) {
-    const message = String(commitMessage ?? '').trim() || `Update ${rel} via overleaf-mcp`;
-    await git(['-C', this.repoPath, 'add', '--', rel]);
+  async commitAndPush(targets, commitMessage) {
+    const rels = Array.isArray(targets) ? targets : [targets];
+    const message = String(commitMessage ?? '').trim() || `Update ${rels[0]} via overleaf-mcp`;
+    // -A so deletions of these paths are staged too, not just new content.
+    await git(['-C', this.repoPath, 'add', '-A', '--', ...rels]);
 
     const { stdout: staged } = await git(['-C', this.repoPath, 'diff', '--cached', '--name-only']);
     if (!staged.trim()) {
-      return { committed: false, message: 'No changes to commit — the file already matched the new content.' };
+      return { committed: false, message: 'No changes to commit — the project already matched the request.' };
     }
 
     await git(['-C', this.repoPath, 'commit', '--quiet', '-m', message]);
